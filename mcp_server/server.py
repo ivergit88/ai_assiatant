@@ -198,9 +198,20 @@ async def search_events(
 
 
 EventId = Annotated[
-    UUID,
-    Field(description="id события — бери из скрытой сводки записей в истории диалога, не выдумывай"),
+    str,
+    Field(
+        description="id события (UUID) — бери из скрытой сводки записей в истории диалога, не выдумывай"
+    ),
 ]
+# GigaChat принимает только format: date/date-time/time в схеме тулов, поэтому event_id —
+# строка, а не UUID (pydantic сгенерировал бы format: "uuid4" и GigaChat вернул бы 422).
+
+
+def _parse_event_id(value: str) -> UUID:
+    try:
+        return UUID(value)
+    except ValueError as error:
+        raise ToolError(f"event_id должен быть UUID, получено: {value!r}") from error
 
 
 @mcp.tool
@@ -234,7 +245,7 @@ async def update_event(
         )
 
     event = await _repo(ctx).update(
-        user_id, event_id, name=name, description=description, start_at=start_at
+        user_id, _parse_event_id(event_id), name=name, description=description, start_at=start_at
     )
     if event is None:
         raise ToolError("Событие не найдено")
@@ -248,7 +259,7 @@ async def complete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Ev
 
     Для «готово», «сделал», «встреча прошла».
     """
-    event = await _repo(ctx).set_status(user_id, event_id, EventStatus.DONE)
+    event = await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.DONE)
     if event is None:
         raise ToolError("Событие не найдено")
     logger.info("completed event %s user=%s", event.id, user_id)
@@ -261,7 +272,7 @@ async def delete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Even
 
     Для «удали», «отмени встречу», «эта задача больше не нужна».
     """
-    event = await _repo(ctx).set_status(user_id, event_id, EventStatus.CANCELLED)
+    event = await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.CANCELLED)
     if event is None:
         raise ToolError("Событие не найдено")
     logger.info("deleted event %s user=%s", event.id, user_id)
