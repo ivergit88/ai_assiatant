@@ -28,8 +28,9 @@ common/        общий код: настройки, контракты (schema
 db/migrations/ схема БД, применяется при первом старте Postgres
 mcp_server/    MCP-тулы для агента (папка не «mcp», чтобы не перекрыть пакет MCP SDK)
 api/           HTTP API для Mini App + генерация .ics
+agent/         агент на GigaChat (через gpt2giga) — см. agent/README.md
 infra/         общий Dockerfile, сервис выбирается через --build-arg GROUP=...
-tests/         26 тестов на живом Postgres: репозиторий, MCP через клиент, API
+tests/         тесты на живом Postgres и Redis: репозиторий, MCP, API, агент
 ```
 
 ## Для C: подключение агента к MCP
@@ -39,8 +40,10 @@ tests/         26 тестов на живом Postgres: репозиторий,
 ```python
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-client = MultiServerMCPClient({"events": {"url": "http://localhost:8001/mcp", "transport": "streamable_http"}})
-tools = await client.get_tools()   # create_event, get_events, search_events
+client = MultiServerMCPClient(
+    {"events": {"url": "http://localhost:8001/mcp", "transport": "streamable_http"}}
+)
+tools = await client.get_tools()  # create_event, get_events, search_events
 ```
 
 | Тул | Аргументы | Возвращает |

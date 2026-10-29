@@ -74,20 +74,59 @@ services:
       timeout: 3s
       retries: 10
 
-  # ---- Сервисы команды: раскомментировать, когда появится код ----
-  # agent:            # C
-  #   <<: *python-service
-  #   build: { context: ., dockerfile: infra/Dockerfile, args: { GROUP: agent } }
-  #   command: ["uvicorn", "agent.main:app", "--host", "0.0.0.0", "--port", "8002"]
-  #   environment:
-  #     MCP_URL: http://mcp:8001/mcp
-  #   ports: ["8002:8002"]
-  #
-  # bot:              # B
+  # OpenAI-совместимый прокси к GigaChat: агент говорит с ним через библиотеку openai.
+  gpt2giga:
+    image: ghcr.io/ai-forever/gpt2giga:0.3.1a1
+    environment:
+      GPT2GIGA_MODE: DEV
+      GPT2GIGA_HOST: 0.0.0.0
+      GPT2GIGA_PORT: 8090
+      GPT2GIGA_ENABLE_API_KEY_AUTH: "True"
+      GPT2GIGA_API_KEY: ${LLM_API_KEY}
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_MODEL: ${LLM_MODEL:-GigaChat-2-Max}
+      GIGACHAT_VERIFY_SSL_CERTS: "False"
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
+
+  agent:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args: { GROUP: agent }
+    command: ["uvicorn", "agent.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    environment:
+      # environment не сливается с якорем, поэтому перечисляем всё заново
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      MCP_URL: http://mcp:8001/mcp
+      LLM_BASE_URL: http://gpt2giga:8090/v1
+    depends_on:
+      redis:
+        condition: service_healthy
+      mcp:
+        condition: service_healthy
+      gpt2giga:
+        condition: service_started
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- Бот (B): раскомментировать, когда появится код ----
+  # bot:
   #   <<: *python-service
   #   build: { context: ., dockerfile: infra/Dockerfile, args: { GROUP: bot } }
   #   command: ["python", "-m", "bot.main"]
   #   environment:
+  #     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  #     REDIS_URL: redis://redis:6379/0
   #     AGENT_URL: http://agent:8002
 
 volumes:
