@@ -48,9 +48,18 @@ tools = await client.get_tools()  # create_event, get_events, search_events
 
 | Тул | Аргументы | Возвращает |
 | --- | --- | --- |
-| `create_event` | `user_id`, `event_type` (task / meeting / reminder), `name`, `description`, `start_at` | событие |
+| `create_event` | `user_id`, `event_type` (task / meeting / reminder), `name`, `description`, `start_at`, `duration_minutes` | событие + `conflicts` |
 | `get_events` | `user_id`, `start_time`, `end_time`, `event_types`, `include_undated_tasks` | список событий по времени |
 | `search_events` | `user_id`, `query`, `start_time`, `end_time`, `limit` | список с `score` и `matched_by` |
+| `update_event` | `user_id`, `event_id`, `name`, `start_at`, `description`, `duration_minutes` | событие + `conflicts` |
+| `complete_event` / `delete_event` | `user_id`, `event_id` | событие |
+
+**Длительность и пересечения.** `duration_minutes` необязателен. Встреча без него длится час,
+дело без него время не занимает (это срок: «сдать отчёт до 18:00»), у напоминания длительности
+нет. В ответе у события есть `end_at` — конец занятого времени (`null`, если время не занято).
+Если новая или перенесённая запись пересекается с активными встречами или делами с
+длительностью, она **всё равно сохраняется**, а пересечения приходят в `conflicts` — агент
+предупреждает пользователя и предлагает перенести. Встык (15:00–16:00 и 16:00) — не пересечение.
 
 Что важно для агента:
 
@@ -82,6 +91,21 @@ tools = await client.get_tools()  # create_event, get_events, search_events
 - **Время в UTC в базе, наружу — в часовом поясе пользователя.** Агенту не нужно пересчитывать.
 - **Один `EventRepository` со всем SQL.** MCP и API — тонкие обёртки над ним, логика не дублируется.
 - **asyncpg и сырой SQL вместо ORM.** Поиск — это CTE с tsvector, trigram и pgvector, в ORM он читался бы хуже.
+- **Пересечение — предупреждение, а не запрет.** Человек может осознанно поставить встречи
+  внахлёст; молча отказать хуже, чем сохранить и спросить «перенести?». Пересечения ищутся
+  одним запросом по индексу `(user_id, start_at)`: полуинтервалы `[start, end)`, а условие
+  «началась не раньше суток назад» отсекает лишнее (запись не длится дольше суток).
+- **Длительность хранится, только если её назвали.** `NULL` значит «по умолчанию для типа» —
+  так видно, где время сказал пользователь, а где подставили мы.
+
+## Обновление базы
+
+Скрипты из `db/migrations` Postgres выполняет только на пустом volume. Если база уже работает
+(есть данные), новую миграцию применить один раз вручную:
+
+```bash
+docker compose exec -T postgres psql -U assistant -d assistant < db/migrations/002_event_duration.sql
+```
 
 ## Что улучшить при наличии времени
 

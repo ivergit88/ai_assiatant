@@ -303,6 +303,48 @@ async def test_update_event_reschedule(make_agent, tz, pool):
     )
 
 
+async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool):
+    """Пересечение: запись сохраняется, модель видит conflicts, а пересекающаяся встреча
+    попадает в скрытую сводку — «перенеси ту встречу» работает следующим сообщением."""
+    existing, _ = make_agent(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Созвон с Иваном",
+                "start_at": tomorrow_at(tz, 15).isoformat(),
+            },
+        ),
+        text("Поставил созвон с Иваном завтра в 15:00."),
+    )
+    first = await existing.handle(USER, "Созвон с Иваном завтра в 15")
+    ivan_id = str(first.events[0].id)
+
+    agent, llm = make_agent(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с дизайнером",
+                "start_at": tomorrow_at(tz, 15).replace(minute=30).isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+        text("Создал. Учтите: в это время уже есть созвон с Иваном с 15:00 до 16:00."),
+    )
+    response = await agent.handle(USER, "Встреча с дизайнером завтра в 15:30 на полчаса")
+
+    tool_message = json.loads(llm.requests[1]["messages"][-1]["content"])
+    assert [c["name"] for c in tool_message["conflicts"]] == ["Созвон с Иваном"]
+    assert "user_id" not in tool_message["conflicts"][0]  # шум вырезан и во вложенных записях
+    assert {e.name for e in response.events} == {"Встреча с дизайнером", "Созвон с Иваном"}
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 2
+
+    history = await agent._memory.load(USER)
+    assert ivan_id in history[-1]["content"]  # id пересекающейся встречи есть в сводке
+    assert "–16:00" in history[-1]["content"]  # и время окончания
+
+
 async def test_complete_and_delete_event(make_agent, tz, pool):
     start = tomorrow_at(tz, 9)
     agent, _ = make_agent(
@@ -319,9 +361,7 @@ async def test_complete_and_delete_event(make_agent, tz, pool):
         tool_call("complete_event", {"event_id": event_id}), text("Отметил выполненным.")
     )
     await agent2.handle(USER, "Отчёт готов")
-    assert (
-        await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id)) == "done"
-    )
+    assert await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id)) == "done"
 
     agent3, _ = make_agent(tool_call("delete_event", {"event_id": event_id}), text("Удалил."))
     await agent3.handle(USER, "Удали эту задачу")

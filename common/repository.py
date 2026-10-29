@@ -9,9 +9,38 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from common.embeddings import Embedder
-from common.schemas import Event, EventCreate, EventStatus, EventType, SearchHit
+from common.schemas import (
+    DEFAULT_MEETING_MINUTES,
+    MAX_DURATION_MINUTES,
+    Event,
+    EventCreate,
+    EventStatus,
+    EventType,
+    SearchHit,
+    busy_interval,
+)
 
-_COLUMNS = "id, user_id, type, name, description, start_at, status, created_at, updated_at"
+_COLUMNS = (
+    "id, user_id, type, name, description, start_at, duration_minutes, status, "
+    "created_at, updated_at"
+)
+
+# Пересечение полуинтервалов: [a_start, a_end) и [b_start, b_end) пересекаются,
+# если a_start < b_end и b_start < a_end. Встреча 15:00–16:00 и встреча в 16:00 — не конфликт.
+# Какие записи занимают время — те же правила, что busy_interval в schemas.py.
+# Условие «start_at > начало − сутки» отсекает лишнее по индексу (user_id, start_at):
+# запись не длится дольше суток, значит начавшаяся раньше нас точно не заденет.
+_CONFLICTS_SQL = f"""
+SELECT {_COLUMNS} FROM events
+WHERE user_id = $1
+  AND status = 'active'
+  AND ($4::uuid IS NULL OR id <> $4)
+  AND (type = 'meeting' OR (type = 'task' AND duration_minutes IS NOT NULL))
+  AND start_at > $2::timestamptz - make_interval(mins => $5)
+  AND start_at < $3::timestamptz
+  AND start_at + make_interval(mins => COALESCE(duration_minutes, $6)) > $2::timestamptz
+ORDER BY start_at
+"""
 
 # Поиск: три независимых способа найти запись, результаты склеиваются через
 # Reciprocal Rank Fusion: score = Σ 1 / (60 + место в выдаче способа).
@@ -81,8 +110,9 @@ class EventRepository:
         embedding = await self._embed_one(_embedding_text(data.type, data.name, data.description))
         row = await self._pool.fetchrow(
             f"""
-            INSERT INTO events (user_id, type, name, description, start_at, embedding)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO events (user_id, type, name, description, start_at, duration_minutes,
+                                embedding)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING {_COLUMNS}
             """,
             data.user_id,
@@ -90,9 +120,31 @@ class EventRepository:
             data.name,
             data.description,
             data.start_at,
+            data.duration_minutes,
             embedding,
         )
         return self._to_event(row)
+
+    async def find_conflicts(self, event: Event) -> list[Event]:
+        """Активные встречи и дела пользователя, пересекающиеся с event по времени.
+
+        Пусто, если сама запись время не занимает (напоминание, дело без длительности).
+        Саму запись в ответ не включаем — это важно после update.
+        """
+        interval = busy_interval(event.type, event.start_at, event.duration_minutes)
+        if interval is None:
+            return []
+        start, end = interval
+        rows = await self._pool.fetch(
+            _CONFLICTS_SQL,
+            event.user_id,
+            start,
+            end,
+            event.id,
+            MAX_DURATION_MINUTES,
+            DEFAULT_MEETING_MINUTES,
+        )
+        return [self._to_event(r) for r in rows]
 
     async def get(self, user_id: str, event_id: UUID) -> Event | None:
         row = await self._pool.fetchrow(
@@ -110,11 +162,12 @@ class EventRepository:
         description: str | None = None,
         start_at: datetime | None = None,
         event_type: EventType | None = None,
+        duration_minutes: int | None = None,
     ) -> Event | None:
         """Частичное обновление: None в параметре — «не менять».
 
         Эмбеддинг пересчитывается, только если изменился смысл записи (name/description/type);
-        перенос времени его не трогает.
+        перенос времени и длительности его не трогает.
         """
         current = await self.get(user_id, event_id)
         if current is None:
@@ -124,6 +177,9 @@ class EventRepository:
         new_description = description if description is not None else current.description
         new_type = event_type if event_type is not None else current.type
         new_start = start_at if start_at is not None else current.start_at
+        new_duration = (
+            duration_minutes if duration_minutes is not None else current.duration_minutes
+        )
 
         recompute = name is not None or description is not None or event_type is not None
         embedding = (
@@ -135,8 +191,8 @@ class EventRepository:
         row = await self._pool.fetchrow(
             f"""
             UPDATE events
-            SET name = $3, description = $4, type = $5, start_at = $6,
-                embedding = COALESCE($7, embedding)
+            SET name = $3, description = $4, type = $5, start_at = $6, duration_minutes = $7,
+                embedding = COALESCE($8, embedding)
             WHERE id = $1 AND user_id = $2
             RETURNING {_COLUMNS}
             """,
@@ -146,6 +202,7 @@ class EventRepository:
             new_description,
             new_type.value,
             new_start,
+            new_duration,
             embedding,
         )
         return self._to_event(row)
@@ -209,7 +266,7 @@ class EventRepository:
         rows = await self._pool.fetch(_SEARCH_SQL, user_id, query, start, end, embedding, limit)
         return [
             SearchHit(
-                **self._to_event(r).model_dump(exclude={"weekday"}),
+                **self._to_event(r).model_dump(exclude={"weekday", "end_at"}),
                 score=round(r["score"], 5),
                 matched_by=list(r["matched_by"]),
             )
@@ -230,6 +287,7 @@ class EventRepository:
             description=row["description"],
             # База отдаёт UTC; наружу — время пользователя, чтобы агенту не пересчитывать.
             start_at=start_at.astimezone(self._tz) if start_at else None,
+            duration_minutes=row["duration_minutes"],
             status=EventStatus(row["status"]),
             created_at=row["created_at"].astimezone(self._tz),
             updated_at=row["updated_at"].astimezone(self._tz),
