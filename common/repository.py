@@ -102,6 +102,68 @@ class EventRepository:
         )
         return None if row is None else self._to_event(row)
 
+    async def update(
+        self,
+        user_id: str,
+        event_id: UUID,
+        name: str | None = None,
+        description: str | None = None,
+        start_at: datetime | None = None,
+        event_type: EventType | None = None,
+    ) -> Event | None:
+        """Частичное обновление: None в параметре — «не менять».
+
+        Эмбеддинг пересчитывается, только если изменился смысл записи (name/description/type);
+        перенос времени его не трогает.
+        """
+        current = await self.get(user_id, event_id)
+        if current is None:
+            return None
+
+        new_name = name if name is not None else current.name
+        new_description = description if description is not None else current.description
+        new_type = event_type if event_type is not None else current.type
+        new_start = start_at if start_at is not None else current.start_at
+
+        recompute = name is not None or description is not None or event_type is not None
+        embedding = (
+            await self._embed_one(_embedding_text(new_type, new_name, new_description))
+            if recompute
+            else None
+        )
+
+        row = await self._pool.fetchrow(
+            f"""
+            UPDATE events
+            SET name = $3, description = $4, type = $5, start_at = $6,
+                embedding = COALESCE($7, embedding)
+            WHERE id = $1 AND user_id = $2
+            RETURNING {_COLUMNS}
+            """,
+            event_id,
+            user_id,
+            new_name,
+            new_description,
+            new_type.value,
+            new_start,
+            embedding,
+        )
+        return self._to_event(row)
+
+    async def set_status(self, user_id: str, event_id: UUID, status: EventStatus) -> Event | None:
+        """Отметить выполненной (done) или удалить мягко (cancelled — пропадает из выдач)."""
+        row = await self._pool.fetchrow(
+            f"""
+            UPDATE events SET status = $3
+            WHERE id = $1 AND user_id = $2
+            RETURNING {_COLUMNS}
+            """,
+            event_id,
+            user_id,
+            status.value,
+        )
+        return None if row is None else self._to_event(row)
+
     async def list_by_period(
         self,
         user_id: str,

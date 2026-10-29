@@ -8,6 +8,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
@@ -111,7 +112,15 @@ def tomorrow_at(tz, hour: int) -> datetime:
 async def test_tools_hide_user_id_and_have_no_anyof():
     tools = await McpToolbox(mcp).openai_tools()
     names = [t["function"]["name"] for t in tools]
-    assert names == ["create_event", "get_events", "search_events", "ask_user"]
+    assert names == [
+        "create_event",
+        "get_events",
+        "search_events",
+        "update_event",
+        "complete_event",
+        "delete_event",
+        "ask_user",
+    ]
 
     dumped = json.dumps(tools, ensure_ascii=False)
     assert "user_id" not in dumped
@@ -265,6 +274,61 @@ async def test_list_today(make_agent, tz):
     await agent.handle(USER, "Напомни завтра в 9 про зарядку")
     response = await agent.handle(USER, "Что у меня завтра?")
     assert [e.name for e in response.events] == ["Зарядка"]
+
+
+async def test_update_event_reschedule(make_agent, tz, pool):
+    start = tomorrow_at(tz, 11)
+    agent, _ = make_agent(
+        tool_call(
+            "create_event",
+            {"event_type": "task", "name": "Созвон с клиентом", "start_at": start.isoformat()},
+        ),
+        text("Поставил на 11:00 завтра."),
+    )
+    created = await agent.handle(USER, "Созвон с клиентом завтра в 11")
+    event_id = str(created.events[0].id)
+
+    new_start = tomorrow_at(tz, 16)
+    agent2, _ = make_agent(
+        tool_call("update_event", {"event_id": event_id, "start_at": new_start.isoformat()}),
+        text("Перенёс на 16:00."),
+    )
+    response = await agent2.handle(USER, "Перенеси созвон на 16:00")
+
+    assert response.status == AgentStatus.DONE
+    assert response.events[0].start_at == new_start
+    assert (
+        await pool.fetchval("SELECT start_at FROM events WHERE id = $1", UUID(event_id))
+        == new_start
+    )
+
+
+async def test_complete_and_delete_event(make_agent, tz, pool):
+    start = tomorrow_at(tz, 9)
+    agent, _ = make_agent(
+        tool_call(
+            "create_event",
+            {"event_type": "task", "name": "Выгрузить отчёт", "start_at": start.isoformat()},
+        ),
+        text("Создал."),
+    )
+    created = await agent.handle(USER, "Выгрузить отчёт завтра в 9")
+    event_id = str(created.events[0].id)
+
+    agent2, _ = make_agent(
+        tool_call("complete_event", {"event_id": event_id}), text("Отметил выполненным.")
+    )
+    await agent2.handle(USER, "Отчёт готов")
+    assert (
+        await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id)) == "done"
+    )
+
+    agent3, _ = make_agent(tool_call("delete_event", {"event_id": event_id}), text("Удалил."))
+    await agent3.handle(USER, "Удали эту задачу")
+    assert (
+        await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id))
+        == "cancelled"
+    )
 
 
 async def test_llm_down_returns_error_and_keeps_history_clean(make_agent, redis):

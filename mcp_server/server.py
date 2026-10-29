@@ -9,6 +9,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
+from uuid import UUID
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -22,7 +23,7 @@ from common.config import get_settings
 from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
-from common.schemas import Event, EventCreate, EventType, SearchHit
+from common.schemas import Event, EventCreate, EventStatus, EventType, SearchHit
 from common.timeutils import ensure_aware
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,77 @@ async def search_events(
     start = ensure_aware(start_time, settings.tz) if start_time else None
     end = ensure_aware(end_time, settings.tz) if end_time else None
     return await _repo(ctx).search(user_id, query.strip(), start, end, limit)
+
+
+EventId = Annotated[
+    UUID,
+    Field(description="id события — бери из скрытой сводки записей в истории диалога, не выдумывай"),
+]
+
+
+@mcp.tool
+async def update_event(
+    user_id: UserId,
+    event_id: EventId,
+    ctx: Context,
+    name: Annotated[
+        str | None, Field(description="Новое короткое название. null — не менять", max_length=200)
+    ] = None,
+    start_at: Annotated[
+        datetime | None,
+        Field(description="Новые дата и время, ISO 8601 со смещением. null — не менять"),
+    ] = None,
+    description: Annotated[
+        str | None, Field(description="Новое описание. null — не менять", max_length=2000)
+    ] = None,
+) -> Event:
+    """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать.
+
+    Для «перенеси её на завтра», «подвинь встречу на 15:00», «переименуй задачу».
+    """
+    if name is None and start_at is None and description is None:
+        raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
+
+    now = datetime.now(get_settings().tz).replace(microsecond=0)
+    if start_at is not None and start_at < now - PAST_TOLERANCE:
+        raise ToolError(
+            f"Время {start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
+            "Проверь вычисление даты или уточни у пользователя."
+        )
+
+    event = await _repo(ctx).update(
+        user_id, event_id, name=name, description=description, start_at=start_at
+    )
+    if event is None:
+        raise ToolError("Событие не найдено")
+    logger.info("updated event %s user=%s", event.id, user_id)
+    return event
+
+
+@mcp.tool
+async def complete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Event:
+    """Отметить задачу, напоминание или встречу выполненной.
+
+    Для «готово», «сделал», «встреча прошла».
+    """
+    event = await _repo(ctx).set_status(user_id, event_id, EventStatus.DONE)
+    if event is None:
+        raise ToolError("Событие не найдено")
+    logger.info("completed event %s user=%s", event.id, user_id)
+    return event
+
+
+@mcp.tool
+async def delete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Event:
+    """Удалить задачу, напоминание или встречу: пропадёт из списков и поиска.
+
+    Для «удали», «отмени встречу», «эта задача больше не нужна».
+    """
+    event = await _repo(ctx).set_status(user_id, event_id, EventStatus.CANCELLED)
+    if event is None:
+        raise ToolError("Событие не найдено")
+    logger.info("deleted event %s user=%s", event.id, user_id)
+    return event
 
 
 @mcp.custom_route("/health", methods=["GET"])
