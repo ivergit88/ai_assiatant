@@ -1,0 +1,106 @@
+"""HTTP API для Mini App (D).
+
+Запуск: uvicorn api.main:app --port 8000. Документация: http://localhost:8000/docs
+"""
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+
+from api.ics import build_ics
+from common.config import get_settings
+from common.db import create_pool
+from common.embeddings import build_embedder
+from common.repository import EventRepository
+from common.schemas import Event, EventType, SearchHit
+from common.timeutils import ensure_aware
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    pool = await create_pool(settings.database_url)
+    embedder = build_embedder(settings)
+    app.state.repo = EventRepository(pool, embedder, settings.tz)
+    try:
+        yield
+    finally:
+        await embedder.aclose()
+        await pool.close()
+
+
+app = FastAPI(title="Voice Assistant API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().api_cors_origins,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+def get_repo(request: Request) -> EventRepository:
+    return request.app.state.repo
+
+
+Repo = Annotated[EventRepository, Depends(get_repo)]
+# TODO(безопасность): сейчас user_id приходит параметром и ему верим на слово.
+# В проде Mini App передаёт подписанные initData, и user_id берётся из них после проверки подписи.
+UserId = Annotated[str, Query(min_length=1, max_length=64, description="ID пользователя MAX")]
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/v1/events", response_model=list[Event])
+async def list_events(
+    repo: Repo,
+    user_id: UserId,
+    from_: Annotated[datetime, Query(alias="from", description="Начало периода (включительно)")],
+    to: Annotated[datetime, Query(description="Конец периода (не включительно)")],
+    type: Annotated[
+        list[EventType] | None, Query(description="Можно несколько: ?type=task&type=meeting")
+    ] = None,
+    include_undated: Annotated[bool, Query(description="Добавить задачи без даты")] = False,
+) -> list[Event]:
+    tz = get_settings().tz
+    start, end = ensure_aware(from_, tz), ensure_aware(to, tz)
+    if start >= end:
+        raise HTTPException(status_code=422, detail="'from' должен быть раньше 'to'")
+    return await repo.list_by_period(user_id, start, end, type, include_undated)
+
+
+@app.get("/v1/events/search", response_model=list[SearchHit])
+async def search_events(
+    repo: Repo,
+    user_id: UserId,
+    q: Annotated[str, Query(min_length=1, max_length=200)],
+    limit: Annotated[int, Query(ge=1, le=20)] = 10,
+) -> list[SearchHit]:
+    return await repo.search(user_id, q.strip(), limit=limit)
+
+
+@app.get(
+    "/v1/events/{event_id}/ics",
+    response_class=Response,
+    responses={200: {"content": {"text/calendar": {}}}},
+)
+async def event_ics(repo: Repo, event_id: UUID, user_id: UserId) -> Response:
+    event = await repo.get(user_id, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Событие не найдено")
+    if event.start_at is None:
+        raise HTTPException(
+            status_code=409, detail="У задачи нет даты — её нельзя добавить в календарь"
+        )
+    return Response(
+        content=build_ics(event),
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="event-{event.id}.ics"'},
+    )

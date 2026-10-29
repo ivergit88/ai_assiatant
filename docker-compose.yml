@@ -1,0 +1,95 @@
+# Весь проект одной командой: docker compose up --build
+# Схема БД применяется при первом старте на пустом volume (db/migrations).
+
+x-python-service: &python-service
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    REDIS_URL: redis://redis:6379/0
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: valkey/valkey:8-alpine  # форк Redis, совместим по протоколу
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mcp:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args: { GROUP: mcp }
+    command: ["python", "-m", "mcp_server.server"]
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args: { GROUP: api }
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- Сервисы команды: раскомментировать, когда появится код ----
+  # agent:            # C
+  #   <<: *python-service
+  #   build: { context: ., dockerfile: infra/Dockerfile, args: { GROUP: agent } }
+  #   command: ["uvicorn", "agent.main:app", "--host", "0.0.0.0", "--port", "8002"]
+  #   environment:
+  #     MCP_URL: http://mcp:8001/mcp
+  #   ports: ["8002:8002"]
+  #
+  # bot:              # B
+  #   <<: *python-service
+  #   build: { context: ., dockerfile: infra/Dockerfile, args: { GROUP: bot } }
+  #   command: ["python", "-m", "bot.main"]
+  #   environment:
+  #     AGENT_URL: http://agent:8002
+
+volumes:
+  pgdata:
+  redisdata:

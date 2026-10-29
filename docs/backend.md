@@ -1,0 +1,89 @@
+# Бэкенд: БД, MCP-сервер, HTTP API
+
+Владелец: A (Алексей). Здесь всё, что нужно агенту (C), Mini App (D) и презентации (F).
+
+## Запуск
+
+```bash
+cp .env.example .env          # GIGACHAT_CREDENTIALS можно оставить пустым
+docker compose up --build     # postgres, valkey, mcp :8001, api :8000
+```
+
+Проверка: `curl localhost:8001/health`, `curl localhost:8000/health`, документация API — http://localhost:8000/docs.
+
+Локально без Docker (нужны Postgres с pgvector и uv):
+
+```bash
+uv sync
+uv run python -m mcp_server.server
+uv run uvicorn api.main:app --reload --port 8000
+```
+
+Тесты на отдельной базе (её содержимое удаляется): `TEST_DATABASE_URL=postgresql://assistant:assistant@localhost:5432/assistant_test uv run pytest`.
+
+## Структура
+
+```
+common/        общий код: настройки, контракты (schemas.py), SQL (repository.py), эмбеддинги
+db/migrations/ схема БД, применяется при первом старте Postgres
+mcp_server/    MCP-тулы для агента (папка не «mcp», чтобы не перекрыть пакет MCP SDK)
+api/           HTTP API для Mini App + генерация .ics
+infra/         общий Dockerfile, сервис выбирается через --build-arg GROUP=...
+tests/         26 тестов на живом Postgres: репозиторий, MCP через клиент, API
+```
+
+## Для C: подключение агента к MCP
+
+Адрес: `http://mcp:8001/mcp` внутри compose, `http://localhost:8001/mcp` снаружи. Транспорт — streamable HTTP.
+
+```python
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+client = MultiServerMCPClient({"events": {"url": "http://localhost:8001/mcp", "transport": "streamable_http"}})
+tools = await client.get_tools()   # create_event, get_events, search_events
+```
+
+| Тул | Аргументы | Возвращает |
+| --- | --- | --- |
+| `create_event` | `user_id`, `event_type` (task / meeting / reminder), `name`, `description`, `start_at` | событие |
+| `get_events` | `user_id`, `start_time`, `end_time`, `event_types`, `include_undated_tasks` | список событий по времени |
+| `search_events` | `user_id`, `query`, `start_time`, `end_time`, `limit` | список с `score` и `matched_by` |
+
+Что важно для агента:
+
+- **`user_id` — в каждом туле.** Агент подставляет его сам из запроса бота, LLM его не придумывает. Надёжнее всего привязать его к тулам в коде агента, а не просить модель.
+- **Даты** — ISO 8601 со смещением. Время без смещения трактуется как московское.
+- **Период — полуинтервал** `[start_time, end_time)`: «сегодня» = с 00:00 сегодня до 00:00 завтра.
+- **Ошибки возвращаются текстом, понятным LLM:** «Для типа 'meeting' нужно указать дату и время», «Время … уже прошло (сейчас …)». На такую ошибку агент должен задать уточняющий вопрос, а не падать.
+- **В ответе есть `weekday`** («пятница»): модель часто ошибается, вычисляя день недели сама.
+- **`search_events.query`** — суть без служебных слов: «договор», а не «найди задачу про договор» (лишние слова тоже не ломают поиск, но мешают нечёткому совпадению).
+
+Отличия от доски Miro: `get_event` → `get_events`, `get_event_by_query` → `search_events`, во все тулы добавлен `user_id`, поле `datetime` называется `start_at`.
+
+## Для D: HTTP API
+
+| Метод | Что делает |
+| --- | --- |
+| `GET /v1/events?user_id&from&to&type&include_undated` | события за период; `type` можно повторять |
+| `GET /v1/events/search?user_id&q&limit` | поиск, как у агента |
+| `GET /v1/events/{id}/ics?user_id` | файл .ics для кнопки «Добавить в календарь»; 409 у задачи без даты |
+
+Формат события — модель `Event` в `common/schemas.py`, полная схема — в `/docs`.
+
+## Решения (для README и презентации)
+
+- **Поиск из трёх сигналов, склеенных через Reciprocal Rank Fusion.** Полнотекстовый по-русски (словоформы: «договору» → «договор»), триграммы (опечатки: «презинтация»), эмбеддинги GigaChat в pgvector (смысл: «слайды» → «презентация»). Оценки этих способов несравнимы, а места в выдаче сравнимы, поэтому RRF без подбора весов. В ответе видно, какой способ нашёл запись (`matched_by`).
+- **Слова запроса через ИЛИ, а не И.** Иначе «задачу про договор» не находит «Подписать договор».
+- **Деградация вместо ошибки.** Нет ключа GigaChat или он недоступен — событие сохраняется без эмбеддинга, поиск работает по тексту.
+- **Правила данных в двух местах.** Встреча и напоминание без времени запрещены и в Pydantic (понятная ошибка для LLM), и CHECK-ограничением в БД (защита от любого кода).
+- **Время в UTC в базе, наружу — в часовом поясе пользователя.** Агенту не нужно пересчитывать.
+- **Один `EventRepository` со всем SQL.** MCP и API — тонкие обёртки над ним, логика не дублируется.
+- **asyncpg и сырой SQL вместо ORM.** Поиск — это CTE с tsvector, trigram и pgvector, в ORM он читался бы хуже.
+
+## Что улучшить при наличии времени
+
+- Проверять подпись `initData` Mini App и брать `user_id` оттуда, а не из параметра запроса.
+- Миграции через Alembic вместо init-скриптов Postgres.
+- Часовой пояс на пользователя, а не один на всех.
+- Фоновая догрузка эмбеддингов для записей, сохранённых при недоступном GigaChat.
+- Порог релевантности для семантического поиска, подобранный на датасете E.
