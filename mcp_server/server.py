@@ -23,7 +23,16 @@ from common.config import get_settings
 from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
-from common.schemas import Event, EventCreate, EventStatus, EventType, SearchHit
+from common.schemas import (
+    MAX_DURATION_MINUTES,
+    Event,
+    EventCreate,
+    EventStatus,
+    EventType,
+    EventWithConflicts,
+    SearchHit,
+    check_duration,
+)
 from common.timeutils import ensure_aware
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,18 @@ EventTypeName = Literal["task", "meeting", "reminder"]
 IsoDateTime = Annotated[
     datetime,
     Field(description="Дата и время в ISO 8601 со смещением, например 2026-10-30T10:00:00+03:00"),
+]
+Duration = Annotated[
+    int | None,
+    Field(
+        description=(
+            "Длительность в минутах, только если пользователь её назвал: «на полчаса» → 30, "
+            "«на два часа» → 120, «с 15 до 17» → 120. Иначе null: встреча по умолчанию "
+            "длится час, дело без длительности время не занимает. У напоминания — всегда null."
+        ),
+        ge=1,
+        le=MAX_DURATION_MINUTES,
+    ),
 ]
 
 
@@ -102,11 +123,14 @@ async def create_event(
             )
         ),
     ] = None,
-) -> Event:
+    duration_minutes: Duration = None,
+) -> EventWithConflicts:
     """Создать задачу, напоминание или встречу.
 
     Если пользователь не назвал время встречи или напоминания — не вызывай тул,
     а сначала спроси время.
+    Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
+    а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
     try:
         data = EventCreate(
@@ -115,6 +139,7 @@ async def create_event(
             name=name,
             description=description,
             start_at=start_at,
+            duration_minutes=duration_minutes,
         )
     except ValidationError as error:
         raise ToolError(_validation_message(error)) from error
@@ -126,9 +151,22 @@ async def create_event(
             "Проверь вычисление даты или уточни у пользователя."
         )
 
-    event = await _repo(ctx).create(data)
-    logger.info("created event %s type=%s user=%s", event.id, event.type, user_id)
-    return event
+    repo = _repo(ctx)
+    event = await repo.create(data)
+    conflicts = await repo.find_conflicts(event)
+    logger.info(
+        "created event %s type=%s user=%s conflicts=%d",
+        event.id,
+        event.type,
+        user_id,
+        len(conflicts),
+    )
+    return EventWithConflicts(**_fields(event), conflicts=conflicts)
+
+
+def _fields(event: Event) -> dict:
+    """Поля события без вычисляемых (weekday, end_at): их модель посчитает сама."""
+    return event.model_dump(exclude={"weekday", "end_at"})
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -200,7 +238,9 @@ async def search_events(
 EventId = Annotated[
     str,
     Field(
-        description="id события (UUID) — бери из скрытой сводки записей в истории диалога, не выдумывай"
+        description=(
+            "id события (UUID) — бери из скрытой сводки записей в истории диалога, не выдумывай"
+        )
     ),
 ]
 # GigaChat принимает только format: date/date-time/time в схеме тулов, поэтому event_id —
@@ -229,12 +269,24 @@ async def update_event(
     description: Annotated[
         str | None, Field(description="Новое описание. null — не менять", max_length=2000)
     ] = None,
-) -> Event:
-    """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать.
+    duration_minutes: Annotated[
+        int | None,
+        Field(
+            description="Новая длительность в минутах («на два часа» → 120). null — не менять",
+            ge=1,
+            le=MAX_DURATION_MINUTES,
+        ),
+    ] = None,
+) -> EventWithConflicts:
+    """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать,
+    поменять длительность.
 
-    Для «перенеси её на завтра», «подвинь встречу на 15:00», «переименуй задачу».
+    Для «перенеси её на завтра», «подвинь встречу на 15:00», «переименуй задачу»,
+    «встреча будет на полчаса».
+    Если новое время пересекается с другими встречами или делами, изменение всё равно
+    сохраняется, а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
-    if name is None and start_at is None and description is None:
+    if name is None and start_at is None and description is None and duration_minutes is None:
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
@@ -244,13 +296,33 @@ async def update_event(
             "Проверь вычисление даты или уточни у пользователя."
         )
 
-    event = await _repo(ctx).update(
-        user_id, _parse_event_id(event_id), name=name, description=description, start_at=start_at
+    repo = _repo(ctx)
+    uuid = _parse_event_id(event_id)
+    current = await repo.get(user_id, uuid)
+    if current is None:
+        raise ToolError("Событие не найдено")
+    try:
+        check_duration(
+            current.type,
+            start_at or current.start_at,
+            duration_minutes if duration_minutes is not None else current.duration_minutes,
+        )
+    except ValueError as error:
+        raise ToolError(str(error)) from error
+
+    event = await repo.update(
+        user_id,
+        uuid,
+        name=name,
+        description=description,
+        start_at=start_at,
+        duration_minutes=duration_minutes,
     )
     if event is None:
         raise ToolError("Событие не найдено")
-    logger.info("updated event %s user=%s", event.id, user_id)
-    return event
+    conflicts = await repo.find_conflicts(event)
+    logger.info("updated event %s user=%s conflicts=%d", event.id, user_id, len(conflicts))
+    return EventWithConflicts(**_fields(event), conflicts=conflicts)
 
 
 @mcp.tool

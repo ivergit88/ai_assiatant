@@ -26,7 +26,8 @@ from common.db import create_pool  # noqa: E402
 from common.embeddings import EMBEDDING_DIM, NullEmbedder  # noqa: E402
 from common.repository import EventRepository  # noqa: E402
 
-MIGRATION = Path(__file__).parents[1] / "db" / "migrations" / "001_init.sql"
+# Все миграции по порядку — так же, как их применяет Postgres-контейнер при первом старте.
+MIGRATIONS = sorted((Path(__file__).parents[1] / "db" / "migrations").glob("*.sql"))
 
 
 class FakeEmbedder:
@@ -67,7 +68,8 @@ async def pool():
 
     conn = await asyncpg.connect(TEST_DSN)
     await conn.execute("DROP TABLE IF EXISTS events CASCADE")
-    await conn.execute(MIGRATION.read_text())
+    for migration in MIGRATIONS:
+        await conn.execute(migration.read_text())
     await conn.close()
 
     pool = await create_pool(TEST_DSN)

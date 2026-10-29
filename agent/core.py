@@ -111,6 +111,11 @@ class Agent:
                 for raw in result.events:
                     event = Event.model_validate(raw)
                     events[str(event.id)] = event
+                    # Пересекающиеся записи тоже в сводку: «перенеси ту встречу» должно
+                    # знать её id, даже если пользователь её в этом диалоге не создавал.
+                    for conflict in raw.get("conflicts") or []:
+                        other = Event.model_validate(conflict)
+                        events.setdefault(str(other.id), other)
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
                 )
@@ -133,8 +138,13 @@ def _with_event_refs(response: AgentResponse) -> str:
     """
     if not response.events:
         return response.reply_text
-    refs = "; ".join(
-        f"id={e.id}, {e.type}, «{e.name}», {e.start_at.isoformat() if e.start_at else 'без даты'}"
-        for e in response.events[:10]
-    )
+    refs = "; ".join(f"id={e.id}, {e.type}, «{e.name}», {_when(e)}" for e in response.events[:10])
     return f"{response.reply_text}\n[записи в этом ответе: {refs}]"
+
+
+def _when(event: Event) -> str:
+    if event.start_at is None:
+        return "без даты"
+    if event.end_at is None:
+        return event.start_at.isoformat()
+    return f"{event.start_at.isoformat()}–{event.end_at.strftime('%H:%M')}"

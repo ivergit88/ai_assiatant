@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta
 
 from common.schemas import Event, EventType
 
-_DURATION = {
-    EventType.MEETING: timedelta(hours=1),
+# Сколько показывать в календаре, если запись сама время не занимает (end_at пустой):
+# у напоминания и дела без длительности есть только момент, а календарю нужен отрезок.
+_DISPLAY_DURATION = {
     EventType.TASK: timedelta(minutes=30),
     EventType.REMINDER: timedelta(minutes=15),
 }
@@ -22,7 +23,11 @@ def build_ics(event: Event, now: datetime | None = None) -> str:
         raise ValueError("У события нет даты — его нельзя добавить в календарь")
 
     start = event.start_at.astimezone(UTC)
-    end = start + _DURATION[event.type]
+    end = (
+        event.end_at.astimezone(UTC)
+        if event.end_at is not None
+        else start + _DISPLAY_DURATION[event.type]
+    )
     alarm_minutes = int(_ALARM_BEFORE[event.type].total_seconds() // 60)
     stamp = (now or datetime.now(UTC)).astimezone(UTC)
 

@@ -73,10 +73,11 @@ _NOISE_FIELDS = frozenset({"user_id", "created_at", "updated_at"})
 
 
 def _compact(value: Any) -> Any:
+    """Рекурсивно: в create/update пересекающиеся записи вложены в поле conflicts."""
     if isinstance(value, list):
         return [_compact(v) for v in value]
     if isinstance(value, dict):
-        return {k: v for k, v in value.items() if k not in _NOISE_FIELDS}
+        return {k: _compact(v) for k, v in value.items() if k not in _NOISE_FIELDS}
     return value
 
 
