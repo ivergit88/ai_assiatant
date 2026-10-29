@@ -119,15 +119,33 @@ services:
       timeout: 3s
       retries: 10
 
-  # ---- Бот (B): раскомментировать, когда появится код ----
-  # bot:
-  #   <<: *python-service
-  #   build: { context: ., dockerfile: infra/Dockerfile, args: { GROUP: bot } }
-  #   command: ["python", "-m", "bot.main"]
-  #   environment:
-  #     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-  #     REDIS_URL: redis://redis:6379/0
-  #     AGENT_URL: http://agent:8002
+  # Бот (B): принимает вебхук от MAX, сам ходит только в Redis (дедупликация/FSM) и в agent —
+  # с базой напрямую не работает, поэтому зависимости от postgres здесь нет.
+  # MAX требует HTTPS на 443 с доверенным сертификатом — в проде перед bot должен стоять
+  # реверс-прокси (или туннель на время теста); порт 8080 наружу — только для него.
+  bot:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args: { GROUP: bot }
+    command: ["uvicorn", "bot.webhook:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
+    environment:
+      # DATABASE_URL из якоря бот не использует; REDIS_URL/AGENT_URL — свои (адрес внутри сети).
+      REDIS_URL: redis://redis:6379/0
+      AGENT_URL: http://agent:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      agent:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:
